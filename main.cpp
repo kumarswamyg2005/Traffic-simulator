@@ -123,9 +123,21 @@ struct Vehicle {
     bool isWaiting = false;
     int waitingSinceFrame = -1;
     int waitingAtIntersection = -1;
+    
+    // Crash physics fields
+    bool crashed = false;
+    float rollAngle = 0.0f;
+    float pitchAngle = 0.0f;
+    float crashVelocityX = 0.0f;
+    float crashVelocityZ = 0.0f;
+    float crashVelocityY = 0.0f;
+    float crashRotation = 0.0f;
+    int crashFrame = 0;
+    bool settled = false;
 };
 
 struct Pedestrian {
+    int id = -1;
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
@@ -179,11 +191,24 @@ struct Intersection {
     float recentWaitCount = 0.0f;
 };
 
+// Collision and crash physics
+struct Crash {
+    int vehicleIndex1;
+    int vehicleIndex2;
+    float impactForce;
+    float impactAngle;
+    int framesSinceCrash;
+    bool active;
+};
+
 std::vector<Vehicle> vehicles;
 std::vector<Pedestrian> pedestrians;
 std::vector<Intersection> intersections;
 std::vector<Particle> weatherParticles;
 std::vector<Particle> exhaustParticles;
+std::vector<Crash> activeCrashes;
+int nextPedestrianId = 0;
+
 
 // GLTF Model storage
 constexpr size_t MAX_TOTAL_PEDESTRIANS = 220;
@@ -222,6 +247,10 @@ std::vector<Star> stars;
 bool starsInitialized = false;
 WeatherType currentWeather = CLEAR;
 int trafficDensity = 10;  // 1-20, default 10
+
+// Rain and Snow toggle features
+bool rainEnabled = false;
+bool snowEnabled = false;
 
 static float randomRange(float minValue, float maxValue) {
     float t = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
@@ -402,6 +431,7 @@ static void spawnRoamingPedestrian() {
 
     Pedestrian p{};
     initializePedestrianAppearance(p);
+    p.id = nextPedestrianId++;
     p.roaming = true;
     p.intersectionIndex = -1;
     p.speed = 0.16f + (rand() % 60) / 220.0f; // roughly 0.16 - 0.43 units per frame
@@ -433,6 +463,7 @@ static void spawnCrosswalkPedestrian() {
 
     Pedestrian p{};
     initializePedestrianAppearance(p);
+    p.id = nextPedestrianId++;
     p.speed = 0.008f + (rand() % 15) / 1000.0f;
     p.waiting = true;
     p.crossing = false;
@@ -503,6 +534,45 @@ enum CameraMode {
 };
 CameraMode currentCameraMode = CAMERA_FREE;
 int followTargetIndex = 0;
+int followPedestrianId = -1;
+int lastCameraPedId = -1;
+
+static int findPedestrianIndexById(int id) {
+    if (id < 0) return -1;
+    for (size_t i = 0; i < pedestrians.size(); ++i) {
+        if (pedestrians[i].id == id) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+static int pickPreferredPedestrianIndex(int fallbackIndex = 0) {
+    if (pedestrians.empty()) {
+        return -1;
+    }
+    for (size_t i = 0; i < pedestrians.size(); ++i) {
+        if (pedestrians[i].roaming) {
+            return static_cast<int>(i);
+        }
+    }
+    int maxIndex = static_cast<int>(pedestrians.size()) - 1;
+    if (maxIndex < 0) return -1;
+    int clampedFallback = std::max(0, std::min(fallbackIndex, maxIndex));
+    return clampedFallback;
+}
+
+static void setFollowPedestrianByIndex(int index) {
+    if (index >= 0 && index < static_cast<int>(pedestrians.size())) {
+        followTargetIndex = index;
+        followPedestrianId = pedestrians[index].id;
+        lastCameraPedId = -1; // force camera smoothing reset on next frame
+    } else {
+        followTargetIndex = 0;
+        followPedestrianId = -1;
+        lastCameraPedId = -1;
+    }
+}
 
 void drawPedestrian(const Pedestrian& p) {
     GLint previousShade = GL_SMOOTH;
@@ -1175,7 +1245,7 @@ void updateWeatherParticles() {
     }
     
     // Spawn new weather particles
-    if (currentWeather == RAIN) {
+    if (currentWeather == RAIN || rainEnabled) {
         for (int i = 0; i < 20; i++) {
             if (weatherParticles.size() >= 2000) break;
             Particle p;
@@ -1186,10 +1256,11 @@ void updateWeatherParticles() {
             p.vy = -3.0f;
             p.vz = randomRange(-0.5f, 0.5f);
             p.life = 1.0f;
+            //rain color change 
             p.r = 0.6f; p.g = 0.6f; p.b = 0.8f; p.a = 0.6f;
             weatherParticles.push_back(p);
         }
-    } else if (currentWeather == SNOW) {
+    } else if (currentWeather == SNOW || snowEnabled) {
         for (int i = 0; i < 15; i++) {
             if (weatherParticles.size() >= 1500) break;
             Particle p;
@@ -1200,7 +1271,8 @@ void updateWeatherParticles() {
             p.vy = -0.8f;
             p.vz = randomRange(-0.3f, 0.3f);
             p.life = 1.0f;
-            p.r = 0.95f; p.g = 0.95f; p.b = 1.0f; p.a = 0.8f;
+            //snow color change 
+            p.r = 1.95f; p.g = 0.95f; p.b = 1.0f; p.a = 0.8f;
             weatherParticles.push_back(p);
         }
     }
@@ -1218,9 +1290,9 @@ void drawWeatherParticles() {
     for (const auto& p : weatherParticles) {
         glColor4f(p.r, p.g, p.b, p.a * p.life);
         glVertex3f(p.x, p.y, p.z);
-        if (currentWeather == RAIN) {
+        if (currentWeather == RAIN || rainEnabled) {
             glVertex3f(p.x + p.vx * 2, p.y + p.vy * 2, p.z + p.vz * 2);
-        } else {
+        } else if (currentWeather == SNOW || snowEnabled) {
             glVertex3f(p.x, p.y - 0.5f, p.z);
         }
     }
@@ -1764,6 +1836,10 @@ void updatePedestrians() {
             }
         } else {
             if (p.intersectionIndex < 0 || p.intersectionIndex >= static_cast<int>(intersections.size())) {
+                if (followPedestrianId == p.id) {
+                    followPedestrianId = -1;
+                    lastCameraPedId = -1;
+                }
                 pit = pedestrians.erase(pit);
                 continue;
             }
@@ -1797,6 +1873,10 @@ void updatePedestrians() {
                 }
 
                 if (p.progress >= 1.0f) {
+                    if (followPedestrianId == p.id) {
+                        followPedestrianId = -1;
+                        lastCameraPedId = -1;
+                    }
                     pit = pedestrians.erase(pit);
                     continue;
                 }
@@ -1959,7 +2039,7 @@ void setupLighting() {
     if (isNight()) {
         // Darker clear color and fog for night
         glClearColor(0.03f, 0.04f, 0.08f, 1.0f);
-        GLfloat fogColor[4] = {0.03f, 0.04f, 0.08f, 1.0f};
+        GLfloat fogColor[4] = {0.05f, 0.06f, 0.12f, 1.0f};
         glFogfv(GL_FOG_COLOR, fogColor);
         // Reduce ambient a bit more at night and add cool-blue tint
         global_ambient[0] = ambientLevel * 0.18f;
@@ -1968,7 +2048,7 @@ void setupLighting() {
     } else {
         // Daytime sky color
         glClearColor(0.53f, 0.81f, 0.92f, 1.0f);
-        GLfloat fogColor[4] = {0.53f, 0.81f, 0.92f, 1.0f};
+        GLfloat fogColor[4] = {0.75f, 0.78f, 0.82f, 1.0f};
         glFogfv(GL_FOG_COLOR, fogColor);
     }
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, global_ambient);
@@ -2696,16 +2776,8 @@ void init() {
     // Enable texturing
     glEnable(GL_TEXTURE_2D);
 
-    // Fog for depth perception
-    glEnable(GL_FOG);
-    {
-        GLfloat fogColor[4] = {0.53f, 0.81f, 0.92f, 1.0f};
-        glFogi(GL_FOG_MODE, GL_LINEAR);
-        glFogfv(GL_FOG_COLOR, fogColor);
-        glFogf(GL_FOG_START, 200.0f);
-        glFogf(GL_FOG_END, 500.0f);
-        glFogf(GL_FOG_DENSITY, 0.015f);
-    }
+    // Fog disabled (not used anymore - replaced with snow)
+    glDisable(GL_FOG);
 
     // Improve material look
     GLfloat global_ambient[] = {0.4f, 0.4f, 0.4f, 1.0f};  // Brighter ambient
@@ -4049,76 +4121,7 @@ void drawDetailedCar(const Vehicle& v, bool addSpoiler = false, bool isTaxi = fa
     drawBox(0.15f, 0.25f, 0.4f);
     glPopMatrix();
     
-    // ===== WHEELS (More detailed) =====
-    float wheelRadius = h * 0.32f;
-    float wheelOffsetX = w * 0.4f;
-    float wheelOffsetZ = d * 0.33f;
-    float wheelY = -h * 0.35f;
-    
-    // Wheel wells (darker recessed areas)
-    glColor3f(0.08f, 0.08f, 0.08f);
-    for (float x = -1.0f; x <= 1.0f; x += 2.0f) {
-        for (float z = -1.0f; z <= 1.0f; z += 2.0f) {
-            glPushMatrix();
-            glTranslatef(x * wheelOffsetX, wheelY + wheelRadius * 0.3f, z * wheelOffsetZ);
-            glScalef(1.0f, 0.6f, 1.0f);
-            glutSolidSphere(wheelRadius * 1.15f, 12, 8);
-            glPopMatrix();
-        }
-    }
-    
-    // Tires (black rubber with treads)
-    glColor3f(0.12f, 0.12f, 0.12f);
-    for (float x = -1.0f; x <= 1.0f; x += 2.0f) {
-        for (float z = -1.0f; z <= 1.0f; z += 2.0f) {
-            glPushMatrix();
-            glTranslatef(x * wheelOffsetX, wheelY, z * wheelOffsetZ);
-            glRotatef(90, 0, 0, 1);
-            // Tire with visible tread
-            glutSolidTorus(wheelRadius * 0.22f, wheelRadius, 10, 20);
-            glPopMatrix();
-        }
-    }
-    
-    // Brake rotors (dark metallic)
-    glColor3f(0.25f, 0.25f, 0.28f);
-    for (float x = -1.0f; x <= 1.0f; x += 2.0f) {
-        for (float z = -1.0f; z <= 1.0f; z += 2.0f) {
-            glPushMatrix();
-            glTranslatef(x * wheelOffsetX, wheelY, z * wheelOffsetZ + x * 0.15f);
-            glRotatef(90, 0, 0, 1);
-            GLUquadric* rotor = gluNewQuadric();
-            gluDisk(rotor, wheelRadius * 0.25f, wheelRadius * 0.65f, 16, 1);
-            gluDeleteQuadric(rotor);
-            glPopMatrix();
-        }
-    }
-    
-    // Rims (chrome/alloy wheels)
-    glColor3f(0.75f, 0.75f, 0.78f);
-    for (float x = -1.0f; x <= 1.0f; x += 2.0f) {
-        for (float z = -1.0f; z <= 1.0f; z += 2.0f) {
-            glPushMatrix();
-            glTranslatef(x * wheelOffsetX, wheelY, z * wheelOffsetZ + x * 0.2f);
-            glRotatef(90, 0, 0, 1);
-            
-            // Center cap
-            GLUquadric* cap = gluNewQuadric();
-            gluDisk(cap, 0, wheelRadius * 0.2f, 12, 1);
-            gluDeleteQuadric(cap);
-            
-            // Spokes (5 spokes design)
-            for (int spoke = 0; spoke < 5; spoke++) {
-                glPushMatrix();
-                glRotatef(spoke * 72.0f, 0, 0, 1);
-                glTranslatef(wheelRadius * 0.35f, 0, 0);
-                glScalef(wheelRadius * 0.45f, wheelRadius * 0.12f, 1.0f);
-                glutSolidCube(1.0);
-                glPopMatrix();
-            }
-            glPopMatrix();
-        }
-    }
+    // OLD WHEEL CODE REMOVED - New cylinder-based wheels rendered below in drawVehicle()
     
     // ===== GRILLE (Front) =====
     glColor3f(secR * 0.8f, secG * 0.8f, secB * 0.8f);
@@ -4250,30 +4253,65 @@ void drawDetailedCar(const Vehicle& v, bool addSpoiler = false, bool isTaxi = fa
 void drawVehicle(const Vehicle& v) {
     glPushMatrix();
     
-    // Compute a small steering yaw for visuals when in the middle of a turn
-    float steeringYaw = 0.0f;
-    if (v.turnProgress > 0.0f) {
-        // Determine turn direction sign by comparing target vs current dir
-        float cross = v.dirX * v.targetDirZ - v.dirZ * v.targetDirX; // positive -> left-ish
-        float sign = (cross > 0.0f) ? 1.0f : -1.0f;
-        // steering angle up to ~18 degrees
-        float eased = 0.5f - 0.5f * cosf(fminf(1.0f, v.turnProgress) * M_PI);
-        steeringYaw = sign * eased * 18.0f;
-    }
+    // If crashed, apply crash physics transformations
+    if (v.crashed) {
+        glTranslatef(v.x, v.y, v.z);
+        
+        // Apply crash rotations - ORDER MATTERS for realistic flip!
+        float yaw = atan2f(v.dirX, v.dirZ) * 180.0f / M_PI;
+        glRotatef(yaw, 0, 1, 0);           // Original heading
+        glRotatef(v.rollAngle, 0, 0, 1);   // Roll (side flip)
+        glRotatef(v.pitchAngle, 1, 0, 0);  // Pitch (front flip)
+        
+        // Draw damaged appearance (darker color)
+        bool addSpoiler = false;
+        bool isTaxi = false;
+        
+        // Darken the vehicle color for crash
+        Vehicle damaged = v;
+        damaged.r *= 0.5f;
+        damaged.g *= 0.5f;
+        damaged.b *= 0.5f;
+        
+        drawDetailedCar(damaged, addSpoiler, isTaxi);
+        
+        // Add smoke/fire effects for active crashes
+        if (!v.settled && v.crashFrame < 180) {
+            glDisable(GL_LIGHTING);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            
+            // Flickering smoke/fire
+            if (v.crashFrame % 4 < 2) {
+                glColor4f(0.3f, 0.3f, 0.3f, 0.5f - v.crashFrame/360.0f);
+                glPushMatrix();
+                glTranslatef(0, 0, 0);
+                glutSolidSphere(v.width * 0.4f, 8, 8);
+                glPopMatrix();
+            }
+            
+            glDisable(GL_BLEND);
+            glEnable(GL_LIGHTING);
+        }
+        
+    } else {
+        // Normal vehicle rendering (not crashed)
+        float steeringYaw = 0.0f;
+        if (v.turnProgress > 0.0f) {
+            float cross = v.dirX * v.targetDirZ - v.dirZ * v.targetDirX;
+            float sign = (cross > 0.0f) ? 1.0f : -1.0f;
+            float eased = 0.5f - 0.5f * cosf(fminf(1.0f, v.turnProgress) * M_PI);
+            steeringYaw = sign * eased * 18.0f;
+        }
 
-    glTranslatef(v.x, v.height/2, v.z);
-    // Orient vehicle to its direction; compute yaw from dirX/dirZ
-    float yaw = atan2f(v.dirX, v.dirZ) * 180.0f / M_PI; // note: swap to get degrees around Y
-    glRotatef(yaw, 0, 1, 0);
-    // Apply steering visual
-    if (steeringYaw != 0.0f) glRotatef(steeringYaw, 0, 1, 0);
-    
-    // Draw standard vehicle body for all types (CAR, TRUCK, BUS)
-    // Determine if we should add optional features
-    bool addSpoiler = (v.type == CAR && v.speed > 0.4f); // Fast cars get spoilers
-    bool isTaxi = false; // Could check vehicle ID or color for taxi designation
-    
-    // Draw the detailed car model
+        glTranslatef(v.x, v.height/2, v.z);
+        float yaw = atan2f(v.dirX, v.dirZ) * 180.0f / M_PI;
+        glRotatef(yaw, 0, 1, 0);
+        if (steeringYaw != 0.0f) glRotatef(steeringYaw, 0, 1, 0);
+        
+        bool addSpoiler = (v.type == CAR && v.speed > 0.4f);
+        bool isTaxi = false;
+        
         drawDetailedCar(v, addSpoiler, isTaxi);
         
         // Headlights: enable at night (emission + light beams)
@@ -4405,97 +4443,331 @@ void drawVehicle(const Vehicle& v) {
             GLfloat noEmission2[] = {0.0f,0.0f,0.0f,1.0f};
             glMaterialfv(GL_FRONT, GL_EMISSION, noEmission2);
         }
+//tryes of the car
 
-        // REALISTIC TIRES with proper proportions
-        float wheelRadius = v.width * 0.18f;      // Smaller radius
-        float tireThickness = wheelRadius * 0.25f; // Thinner torus profile
-        float tireWidth = wheelRadius * 0.6f;      // Tire width
-        float rimRadius = wheelRadius * 0.7f;      // Rim slightly smaller than outer radius
+        // Complete tire and wheel implementation
+        // Each car has 8 wheel components: 4 tires (black) + 4 rims (silver)
         
-        // Helper lambda to draw a complete wheel with treads and spokes
-        auto drawRealisticWheel = [&](float sideMultiplier) {
-            // Black rubber tire (torus) with tread pattern
-            glColor3f(0.15f, 0.15f, 0.15f);
-            glutSolidTorus(tireThickness, wheelRadius, 12, 20);
-            
-            // Tire tread grooves (raised rectangles around tire)
-            glColor3f(0.1f, 0.1f, 0.1f);
-            for (int t = 0; t < 16; t++) {
-                float angle = (t / 16.0f) * 2.0f * M_PI;
-                glPushMatrix();
-                glRotatef(angle * 180.0f / M_PI, 0, 0, 1);
-                glTranslatef(wheelRadius, 0, 0);
-                glScalef(0.15f, 0.08f, tireWidth * 0.3f);
-                glutSolidCube(1.0f);
-                glPopMatrix();
-            }
-            
-            // Dark gray rim (cylinder) - centered in tire
-            glPushMatrix();
-            glTranslatef(0, 0, -tireWidth * 0.25f);
-            glColor3f(0.35f, 0.35f, 0.4f);
-            GLUquadric* quad = gluNewQuadric();
-            gluCylinder(quad, rimRadius, rimRadius, tireWidth * 0.5f, 16, 1);
-            gluDeleteQuadric(quad);
-            glPopMatrix();
-            
-            // Rim spokes (6 spokes radiating from center)
-            glDisable(GL_LIGHTING);
-            glColor3f(0.5f, 0.5f, 0.55f);
-            for (int s = 0; s < 6; s++) {
-                float spokeAngle = (s / 6.0f) * 2.0f * M_PI;
-                glPushMatrix();
-                glRotatef(spokeAngle * 180.0f / M_PI, 0, 0, 1);
-                glTranslatef(rimRadius * 0.5f, 0, 0);
-                glScalef(rimRadius * 0.9f, 0.08f, 0.08f);
-                glutSolidCube(1.0f);
-                glPopMatrix();
-            }
-            
-            // Center hub cap
-            glColor3f(0.6f, 0.6f, 0.65f);
-            glPushMatrix();
-            glTranslatef(0, 0, -tireWidth * 0.15f);
-            quad = gluNewQuadric();
-            gluCylinder(quad, rimRadius * 0.3f, rimRadius * 0.3f, tireWidth * 0.3f, 12, 1);
-            gluDeleteQuadric(quad);
-            glPopMatrix();
-            glEnable(GL_LIGHTING);
+        // ===== ENHANCED TIRE SYSTEM WITH REALISTIC DETAILS =====
+        
+        // TIRE SPECIFICATIONS (Professional Grade)
+        float tire_outer_radius = 0.30f * v.height;    // Main tire outer diameter
+        float tire_inner_radius = 0.20f * v.height;    // Rim contact point
+        float tire_width = 0.20f * v.height;           // Tire profile width
+        float sidewall_bulge = 0.02f * v.height;       // Realistic sidewall curvature
+        
+        // RIM SPECIFICATIONS (Sporty Alloy Design)
+        float rim_outer = 0.195f * v.height;           // Rim outer edge
+        float rim_inner = 0.08f * v.height;            // Hub center
+        float rim_width = 0.14f * v.height;            // Rim depth
+        float spoke_depth = 0.01f * v.height;          // 3D spoke depth
+        
+        // WHEEL POSITIONS (optimized stance)
+        float front_z = 0.45f * v.depth;
+        float back_z = -0.45f * v.depth;
+        float left_x = -0.35f * v.width;
+        float right_x = 0.25f * v.width;
+        float wheel_y = -0.41f * v.height;             // Slightly lower for better ground contact
+        
+        float wheel_positions[4][2] = {
+            {left_x, front_z},   {left_x, back_z},
+            {right_x, front_z},  {right_x, back_z}
         };
         
-        // Front left wheel
-        glPushMatrix();
-        glTranslatef(v.width * 0.5f, -v.height * 0.42f, v.depth * 0.32f);
-        glRotatef(90, 0, 0, 1);
-        drawRealisticWheel(1.0f);
-        glPopMatrix();
+        GLUquadric* quad = gluNewQuadric();
+        gluQuadricDrawStyle(quad, GLU_FILL);
+        gluQuadricNormals(quad, GLU_SMOOTH);
         
-        // Front right wheel  
-        glPushMatrix();
-        glTranslatef(-v.width * 0.5f, -v.height * 0.42f, v.depth * 0.32f);
-        glRotatef(-90, 0, 0, 1);
-        drawRealisticWheel(-1.0f);
-        glPopMatrix();
+        // ===== PASS 1: REALISTIC TIRE RUBBER WITH SIDEWALL DETAIL =====
+        for (int i = 0; i < 4; i++) {
+            glPushMatrix();
+            glTranslatef(wheel_positions[i][0], wheel_y, wheel_positions[i][1]);
+            glRotatef(90, 0, 1, 0);
+            
+            // Main tire body - darker black rubber
+            glColor3f(0.08f, 0.08f, 0.08f);
+            gluCylinder(quad, tire_outer_radius, tire_outer_radius, tire_width, 24, 1);
+            
+            // Outer sidewall with subtle bulge (convex curve)
+            glColor3f(0.12f, 0.12f, 0.12f);  // Slightly lighter for depth
+            for (int seg = 0; seg < 8; seg++) {
+                float t1 = seg / 8.0f;
+                float t2 = (seg + 1) / 8.0f;
+                float z1 = t1 * tire_width;
+                float z2 = t2 * tire_width;
+                float bulge1 = sidewall_bulge * sin(t1 * 3.14159f);
+                float bulge2 = sidewall_bulge * sin(t2 * 3.14159f);
+                
+                glBegin(GL_QUAD_STRIP);
+                for (int a = 0; a <= 24; a++) {
+                    float angle = a * 2.0f * 3.14159f / 24.0f;
+                    float cx = cos(angle);
+                    float cy = sin(angle);
+                    glNormal3f(cx, cy, 0);
+                    glVertex3f(cx * (tire_outer_radius + bulge1), cy * (tire_outer_radius + bulge1), z1);
+                    glVertex3f(cx * (tire_outer_radius + bulge2), cy * (tire_outer_radius + bulge2), z2);
+                }
+                glEnd();
+            }
+            
+            // Inner tire walls (contact with rim)
+            glColor3f(0.05f, 0.05f, 0.05f);  // Very dark
+            gluDisk(quad, tire_inner_radius, tire_outer_radius, 24, 2);
+            glPushMatrix();
+            glTranslatef(0, 0, tire_width);
+            gluDisk(quad, tire_inner_radius, tire_outer_radius, 24, 2);
+            glPopMatrix();
+            
+            // Tread pattern (subtle grooves)
+            glColor3f(0.06f, 0.06f, 0.06f);
+            for (int t = 0; t < 16; t++) {
+                float angle = t * 22.5f;
+                glPushMatrix();
+                glRotatef(angle, 0, 0, 1);
+                glTranslatef(tire_outer_radius - 0.01f, 0, tire_width * 0.5f);
+                glutSolidCube(0.02f * v.height);
+                glPopMatrix();
+            }
+            
+            glPopMatrix();
+        }
         
-        // Rear left wheel
-        glPushMatrix();
-        glTranslatef(v.width * 0.5f, -v.height * 0.42f, -v.depth * 0.32f);
-        glRotatef(90, 0, 0, 1);
-        drawRealisticWheel(1.0f);
-        glPopMatrix();
+        // ===== PASS 2: PREMIUM ALLOY RIMS WITH SPOKE DESIGN =====
+        for (int i = 0; i < 4; i++) {
+            glPushMatrix();
+            glTranslatef(wheel_positions[i][0], wheel_y, wheel_positions[i][1]);
+            glRotatef(90, 0, 1, 0);
+            
+            float rim_offset = (tire_width - rim_width) / 2.0f;
+            glTranslatef(0, 0, rim_offset);
+            
+            // Rim base cylinder - brushed aluminum look
+            glColor3f(0.6f, 0.6f, 0.65f);
+            gluCylinder(quad, rim_outer, rim_outer, rim_width, 20, 1);
+            
+            // Front rim face with 5-spoke design
+            glColor3f(0.65f, 0.65f, 0.7f);  // Polished look
+            gluDisk(quad, rim_inner, rim_outer, 20, 3);
+            
+            // 5 raised spokes for depth
+            for (int s = 0; s < 5; s++) {
+                float spoke_angle = s * 72.0f;  // 360/5 = 72 degrees
+                glPushMatrix();
+                glRotatef(spoke_angle, 0, 0, 1);
+                
+                // Spoke as elongated box from hub to rim edge
+                glColor3f(0.7f, 0.7f, 0.75f);  // Brighter spoke
+                glPushMatrix();
+                glTranslatef(rim_outer * 0.5f, 0, -spoke_depth);
+                glScalef(rim_outer * 0.8f, rim_outer * 0.12f, spoke_depth * 2);
+                glutSolidCube(1.0f);
+                glPopMatrix();
+                
+                glPopMatrix();
+            }
+            
+            // Center hub cap - chrome effect
+            glColor3f(0.8f, 0.8f, 0.85f);
+            gluDisk(quad, 0, rim_inner, 16, 2);
+            glPushMatrix();
+            glTranslatef(0, 0, -0.015f);
+            gluCylinder(quad, rim_inner * 0.6f, rim_inner, 0.015f, 12, 1);
+            glPopMatrix();
+            
+            // Back rim face
+            glPushMatrix();
+            glTranslatef(0, 0, rim_width);
+            glColor3f(0.55f, 0.55f, 0.6f);  // Darker back
+            gluDisk(quad, rim_inner, rim_outer, 20, 2);
+            glPopMatrix();
+            
+            glPopMatrix();
+        }
         
-        // Rear right wheel
-        glPushMatrix();
-        glTranslatef(-v.width * 0.5f, -v.height * 0.42f, -v.depth * 0.32f);
-        glRotatef(-90, 0, 0, 1);
-        drawRealisticWheel(-1.0f);
-        glPopMatrix();
+        gluDeleteQuadric(quad);
+    }
     
     glPopMatrix();
 }
 
+// Detect collisions between vehicles
+void detectCollisions() {
+    for (size_t i = 0; i < vehicles.size(); i++) {
+        if (vehicles[i].crashed) continue;
+        
+        for (size_t j = i + 1; j < vehicles.size(); j++) {
+            if (vehicles[j].crashed) continue;
+            
+            Vehicle& v1 = vehicles[i];
+            Vehicle& v2 = vehicles[j];
+            
+            float dx = v1.x - v2.x;
+            float dz = v1.z - v2.z;
+            float distance = sqrt(dx * dx + dz * dz);
+            
+            // Better collision detection using width and depth
+            float avgWidth = (v1.width + v2.width) * 0.4f;
+            float avgDepth = (v1.depth + v2.depth) * 0.4f;
+            float collisionDist = sqrt(avgWidth * avgWidth + avgDepth * avgDepth);
+            
+            if (distance < collisionDist) {
+                printf("💥 CRASH! Vehicle %zu hit vehicle %zu\n", i, j);
+                
+                float relVelX = (v1.dirX * v1.speed) - (v2.dirX * v2.speed);
+                float relVelZ = (v1.dirZ * v1.speed) - (v2.dirZ * v2.speed);
+                float impactForce = sqrt(relVelX * relVelX + relVelZ * relVelZ);
+                
+                float impactX = dx / (distance + 0.001f);
+                float impactZ = dz / (distance + 0.001f);
+                
+                // Only flip if significant speed difference and enough impact force
+                bool v1Flips = (impactForce > 0.4f) && ((v1.speed > v2.speed * 1.4f) || (v1.type == CAR && v2.type != CAR));
+                bool v2Flips = (impactForce > 0.4f) && ((v2.speed > v1.speed * 1.4f) || (v2.type == CAR && v1.type != CAR));
+                
+                v1.crashed = true;
+                v1.crashFrame = 0;
+                v1.settled = false;
+                v1.crashVelocityX = impactX * impactForce * 0.9f;
+                v1.crashVelocityZ = impactZ * impactForce * 0.9f;
+                
+                if (v1Flips && impactForce > 0.5f) {
+                    v1.crashVelocityY = 0.15f + impactForce * 0.3f;
+                    v1.crashRotation = (rand() % 2 ? 1.0f : -1.0f) * (2.5f + impactForce * 5.0f);
+                } else {
+                    v1.crashVelocityY = 0.05f + impactForce * 0.1f;
+                    v1.crashRotation = (rand() % 2 ? 1.0f : -1.0f) * (1.0f + impactForce * 2.0f);
+                }
+                
+                v2.crashed = true;
+                v2.crashFrame = 0;
+                v2.settled = false;
+                v2.crashVelocityX = -impactX * impactForce * 0.9f;
+                v2.crashVelocityZ = -impactZ * impactForce * 0.9f;
+                
+                if (v2Flips && impactForce > 0.5f) {
+                    v2.crashVelocityY = 0.15f + impactForce * 0.3f;
+                    v2.crashRotation = (rand() % 2 ? 1.0f : -1.0f) * (2.5f + impactForce * 5.0f);
+                } else {
+                    v2.crashVelocityY = 0.05f + impactForce * 0.1f;
+                    v2.crashRotation = (rand() % 2 ? 1.0f : -1.0f) * (1.0f + impactForce * 2.0f);
+                }
+                
+                Crash crash;
+                crash.vehicleIndex1 = i;
+                crash.vehicleIndex2 = j;
+                crash.impactForce = impactForce;
+                crash.impactAngle = atan2(dz, dx);
+                crash.framesSinceCrash = 0;
+                crash.active = true;
+                activeCrashes.push_back(crash);
+            }
+        }
+    }
+}
+
+// Update crashed vehicles with physics
+void updateCrashedVehicles() {
+    const float GRAVITY = 0.01f;
+    const float FRICTION = 0.94f;
+    const float GROUND_LEVEL = 0.0f;
+    const float BOUNCE_DAMPING = 0.25f;
+    
+    for (auto& v : vehicles) {
+        if (!v.crashed || v.settled) continue;
+        
+        v.crashFrame++;
+        
+        v.crashVelocityY -= GRAVITY;
+        
+        v.x += v.crashVelocityX;
+        v.z += v.crashVelocityZ;
+        v.y += v.crashVelocityY;
+        
+        v.rollAngle += v.crashRotation;
+        
+        if (fabs(v.crashVelocityY) > 0.05f) {
+            v.pitchAngle += v.crashRotation * 0.5f;
+        }
+        
+        if (v.y <= v.height/2 + GROUND_LEVEL) {
+            v.y = v.height/2 + GROUND_LEVEL;
+            
+            if (fabs(v.crashVelocityY) > 0.025f) {
+                v.crashVelocityY = -v.crashVelocityY * BOUNCE_DAMPING;
+                v.crashRotation *= 0.65f;
+            } else {
+                v.crashVelocityY = 0.0f;
+                v.crashVelocityX *= FRICTION;
+                v.crashVelocityZ *= FRICTION;
+                v.crashRotation *= 0.8f;
+                
+                if (fabs(v.crashVelocityX) < 0.015f && 
+                    fabs(v.crashVelocityZ) < 0.015f && 
+                    fabs(v.crashRotation) < 0.6f) {
+                    v.settled = true;
+                }
+            }
+        }
+        
+        v.crashVelocityX *= FRICTION;
+        v.crashVelocityZ *= FRICTION;
+    }
+    
+    // Remove old crashed vehicles
+    vehicles.erase(
+        std::remove_if(vehicles.begin(), vehicles.end(),
+            [](const Vehicle& v) { return v.crashed && v.crashFrame > 900; }),
+        vehicles.end()
+    );
+}
+
+// Update crash effects
+void updateCrashEffects() {
+    for (auto it = activeCrashes.begin(); it != activeCrashes.end();) {
+        it->framesSinceCrash++;
+        
+        if (it->framesSinceCrash < 80 && it->vehicleIndex1 < vehicles.size() && it->vehicleIndex2 < vehicles.size()) {
+            const Vehicle& v1 = vehicles[it->vehicleIndex1];
+            const Vehicle& v2 = vehicles[it->vehicleIndex2];
+            
+            float crashX = (v1.x + v2.x) * 0.5f;
+            float crashY = (v1.y + v2.y) * 0.5f;
+            float crashZ = (v1.z + v2.z) * 0.5f;
+            
+            for (int i = 0; i < 4; i++) {
+                Particle p;
+                p.x = crashX + randomRange(-2.5f, 2.5f);
+                p.y = crashY + randomRange(0.5f, 3.5f);
+                p.z = crashZ + randomRange(-2.5f, 2.5f);
+                p.vx = randomRange(-0.4f, 0.4f);
+                p.vy = randomRange(0.15f, 0.5f);
+                p.vz = randomRange(-0.4f, 0.4f);
+                p.life = 1.0f;
+                p.r = 0.25f;
+                p.g = 0.25f;
+                p.b = 0.25f;
+                p.a = 0.7f;
+                
+                exhaustParticles.push_back(p);
+            }
+        }
+        
+        if (it->framesSinceCrash > 400) {
+            it = activeCrashes.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void updateVehicles() {
     for (auto it = vehicles.begin(); it != vehicles.end();) {
+        // Skip crashed vehicles (they're handled by updateCrashedVehicles)
+        if (it->crashed) {
+            ++it;
+            continue;
+        }
+        
         bool shouldStop = false;
         // compute current movement vector by interpolating if turning
         float moveDX = it->dirX;
@@ -5035,54 +5307,95 @@ void display() {
             
         case CAMERA_FOLLOW_PEDESTRIAN:
             if (!pedestrians.empty()) {
-                followTargetIndex = followTargetIndex % pedestrians.size();
-                const Pedestrian& p = pedestrians[followTargetIndex];
-                
-                // Calculate pedestrian's direction vector (same as car)
-                float pedDirX = 0.0f, pedDirZ = 0.0f;
-                if (p.crossAxis == 0) { // moving along X-axis
-                    pedDirX = (float)p.dir;  // -1 or +1
-                } else { // moving along Z-axis
-                    pedDirZ = (float)p.dir;  // -1 or +1
+                int pedIndex = findPedestrianIndexById(followPedestrianId);
+                if (pedIndex < 0) {
+                    pedIndex = pickPreferredPedestrianIndex(followTargetIndex);
+                    setFollowPedestrianByIndex(pedIndex);
+                } else {
+                    followTargetIndex = pedIndex;
                 }
-                
-                // Calculate angle using atan2
-                float pedAngle = atan2(pedDirX, pedDirZ);
-                
-                // Close third-person camera - behind and above head to see neck/back
-                float followDistance = 2.5f;   // Very close behind
-                float cameraHeight = 4.5f;     // Just above head height  
-                float sideOffset = 0.0f;       // Directly behind, no side offset
-                
-                // Position camera close behind pedestrian's head
-                actualCamX = p.x - sin(pedAngle) * followDistance;
-                actualCamY = p.y + cameraHeight;  // Above head to see neck
-                actualCamZ = p.z - cos(pedAngle) * followDistance;
-                
-                // Apply smooth camera movement
-                smoothCamX += (actualCamX - smoothCamX) * smoothFactor;
-                smoothCamY += (actualCamY - smoothCamY) * smoothFactor;
-                smoothCamZ += (actualCamZ - smoothCamZ) * smoothFactor;
-                
-                // Use smoothed camera position
-                actualCamX = smoothCamX;
-                actualCamY = smoothCamY;
-                actualCamZ = smoothCamZ;
 
-                // Look forward in the direction the pedestrian is walking
-                float lookAheadDistance = 20.0f;  // Look far ahead to see the world
-                float targetLookX = p.x + pedDirX * lookAheadDistance;
-                float targetLookY = p.y + 2.5f;  // Eye level - horizon view
-                float targetLookZ = p.z + pedDirZ * lookAheadDistance;
-                
-                smoothLookX += (targetLookX - smoothLookX) * smoothFactor;
-                smoothLookY += (targetLookY - smoothLookY) * smoothFactor;
-                smoothLookZ += (targetLookZ - smoothLookZ) * smoothFactor;
-                
-                lookX = smoothLookX;
-                lookY = smoothLookY;
-                lookZ = smoothLookZ;
+                if (pedIndex >= 0 && pedIndex < static_cast<int>(pedestrians.size())) {
+                    const Pedestrian& p = pedestrians[pedIndex];
+
+                    // Determine pedestrian direction (normalized)
+                    float pedDirX = p.moveDirX;
+                    float pedDirZ = p.moveDirZ;
+                    float dirLength = std::sqrt(pedDirX * pedDirX + pedDirZ * pedDirZ);
+
+                    if (dirLength < 0.0001f) {
+                        if (p.crossAxis == 0) {
+                            pedDirX = 0.0f;
+                            pedDirZ = static_cast<float>(p.dir);
+                        } else {
+                            pedDirX = static_cast<float>(p.dir);
+                            pedDirZ = 0.0f;
+                        }
+                        dirLength = std::sqrt(pedDirX * pedDirX + pedDirZ * pedDirZ);
+                    }
+
+                    if (dirLength < 0.0001f) {
+                        pedDirX = 0.0f;
+                        pedDirZ = 1.0f;
+                        dirLength = 1.0f;
+                    }
+
+                    pedDirX /= dirLength;
+                    pedDirZ /= dirLength;
+
+                    // FIRST-PERSON from back of head, looking forward
+                    float eyeHeight = std::max(4.80f, 3.80f * p.heightScale);
+                    
+                    // Camera positioned at back of head (slightly behind and up)
+                    float backOffset = 0.2f;  // Slight offset behind head center
+                    float targetCamX = p.x - pedDirX * backOffset;
+                    float targetCamY = p.y + eyeHeight;
+                    float targetCamZ = p.z - pedDirZ * backOffset;
+
+                    // Look forward in walking direction (ahead of pedestrian)
+                    float lookDistance = 25.0f;
+                    float targetLookX = p.x + pedDirX * lookDistance;
+                    float targetLookY = p.y + eyeHeight * 0.95f;  // Slightly downward gaze
+                    float targetLookZ = p.z + pedDirZ * lookDistance;
+
+                    // Smooth transition ALWAYS (including when switching pedestrians)
+                    if (lastCameraPedId != followPedestrianId) {
+                        lastCameraPedId = followPedestrianId;
+                    }
+
+                    // Smooth interpolation with faster transition on switch
+                    float transitionSpeed = smoothFactor;
+                    if (lastCameraPedId != followPedestrianId) {
+                        transitionSpeed = 0.15f;  // Faster transition when switching
+                    }
+                    
+                    smoothCamX += (targetCamX - smoothCamX) * transitionSpeed;
+                    smoothCamY += (targetCamY - smoothCamY) * transitionSpeed;
+                    smoothCamZ += (targetCamZ - smoothCamZ) * transitionSpeed;
+
+                    smoothLookX += (targetLookX - smoothLookX) * transitionSpeed;
+                    smoothLookY += (targetLookY - smoothLookY) * transitionSpeed;
+                    smoothLookZ += (targetLookZ - smoothLookZ) * transitionSpeed;
+
+                    actualCamX = smoothCamX;
+                    actualCamY = smoothCamY;
+                    actualCamZ = smoothCamZ;
+
+                    lookX = smoothLookX;
+                    lookY = smoothLookY;
+                    lookZ = smoothLookZ;
+                } else {
+                    actualCamX = cameraX;
+                    actualCamY = cameraY;
+                    actualCamZ = cameraZ;
+                    lookX = cameraX + sin(cameraYaw * M_PI / 180.0f);
+                    lookY = cameraY;
+                    lookZ = cameraZ + cos(cameraYaw * M_PI / 180.0f);
+                }
             } else {
+                actualCamX = cameraX;
+                actualCamY = cameraY;
+                actualCamZ = cameraZ;
                 lookX = cameraX + sin(cameraYaw * M_PI / 180.0f);
                 lookY = cameraY ;
                 lookZ = cameraZ + cos(cameraYaw * M_PI / 180.0f);
@@ -5219,6 +5532,9 @@ void timer(int value) {
     updateTrafficLights();
     spawnVehicles();
     updateVehicles();
+    detectCollisions();
+    updateCrashedVehicles();
+    updateCrashEffects();
     updateWeatherParticles();
     updateExhaustParticles();
     // pedestrian logic
@@ -5255,6 +5571,8 @@ void keyboard(unsigned char key, int x, int y) {
             cameraZ = 150.0f;
             cameraYaw = 0.0f;
             cameraPitch = -20.0f;
+            followPedestrianId = -1;
+            lastCameraPedId = -1;
             break;
         case ' ':
             autoRotate = !autoRotate;
@@ -5262,12 +5580,16 @@ void keyboard(unsigned char key, int x, int y) {
         // Camera mode switching
         case '1':
             currentCameraMode = CAMERA_FREE;
+            followPedestrianId = -1;
+            lastCameraPedId = -1;
             printf("=== Camera Mode 1: FREE ===\n");
             printf("    WASD: Move camera, E/C: Up/Down, Arrows: Look around\n");
             break;
         case '2':
             currentCameraMode = CAMERA_FOLLOW_CAR;
             followTargetIndex = 0;
+            followPedestrianId = -1;
+            lastCameraPedId = -1;
             if (!vehicles.empty()) {
                 printf("=== Camera Mode 2: FOLLOW CAR ===\n");
                 printf("    Following vehicle %d of %zu\n", followTargetIndex + 1, vehicles.size());
@@ -5279,20 +5601,25 @@ void keyboard(unsigned char key, int x, int y) {
             break;
         case '3':
             currentCameraMode = CAMERA_FOLLOW_PEDESTRIAN;
-            followTargetIndex = 0;
             if (!pedestrians.empty()) {
-                // Ensure index is valid
-                followTargetIndex = followTargetIndex % pedestrians.size();
+                int preferredIndex = pickPreferredPedestrianIndex(0);
+                if (preferredIndex < 0) {
+                    preferredIndex = 0;
+                }
+                setFollowPedestrianByIndex(preferredIndex);
                 printf("=== Camera Mode 3: FOLLOW PEDESTRIAN ===\n");
                 printf("    Following pedestrian %d of %zu\n", followTargetIndex + 1, pedestrians.size());
                 printf("    Press N: Next pedestrian, M: Previous pedestrian\n");
             } else {
+                setFollowPedestrianByIndex(-1);
                 printf("=== Camera Mode 3: FOLLOW PEDESTRIAN ===\n");
                 printf("    No pedestrians available!\n");
             }
             break;
         case '4':
             currentCameraMode = CAMERA_BUILDING_VIEW;
+            followPedestrianId = -1;
+            lastCameraPedId = -1;
             printf("=== Camera Mode 4: BUILDING VIEW ===\n");
             printf("    Bird's eye view of the city\n");
             break;
@@ -5318,17 +5645,49 @@ void keyboard(unsigned char key, int x, int y) {
         case 'L':
             currentWeather = CLEAR;
             weatherParticles.clear();
+            rainEnabled = false;
+            snowEnabled = false;
             printf("Weather: CLEAR\n");
             break;
         case 'p':
         case 'P':
             currentWeather = RAIN;
+            rainEnabled = false;  // Use old weather system
             printf("Weather: RAIN\n");
             break;
         case 'o':
         case 'O':
             currentWeather = SNOW;
             printf("Weather: SNOW\n");
+            break;
+        
+        // Rain Toggle (J key)
+        case 'j':
+        case 'J':
+            rainEnabled = !rainEnabled;
+            if (rainEnabled) {
+                printf("Rain: ENABLED\n");
+            } else {
+                printf("Rain: DISABLED\n");
+                weatherParticles.clear();
+            }
+            break;
+        
+        // Snow Toggle (F key)
+        case 'f':
+        case 'F':
+            snowEnabled = !snowEnabled;
+            if (snowEnabled) {
+                printf("Snow: ENABLED\n");
+            } else {
+                printf("Snow: DISABLED\n");
+                // Clear snow particles
+                weatherParticles.erase(
+                    std::remove_if(weatherParticles.begin(), weatherParticles.end(),
+                        [](const Particle& p) { return p.r > 0.9f; }),
+                    weatherParticles.end()
+                );
+            }
             break;
         
         // Traffic Density Controls (5-9 keys)
@@ -5363,8 +5722,15 @@ void keyboard(unsigned char key, int x, int y) {
                 followTargetIndex = (followTargetIndex + 1) % vehicles.size();
                 printf("Following vehicle %d of %zu\n", followTargetIndex + 1, vehicles.size());
             } else if (currentCameraMode == CAMERA_FOLLOW_PEDESTRIAN && !pedestrians.empty()) {
-                // Ensure we stay within valid range
-                followTargetIndex = (followTargetIndex + 1) % pedestrians.size();
+                int currentIndex = findPedestrianIndexById(followPedestrianId);
+                if (currentIndex < 0) {
+                    currentIndex = pickPreferredPedestrianIndex(followTargetIndex);
+                }
+                if (currentIndex < 0) {
+                    currentIndex = 0;
+                }
+                int nextIndex = (currentIndex + 1) % static_cast<int>(pedestrians.size());
+                setFollowPedestrianByIndex(nextIndex);
                 printf("Following pedestrian %d of %zu\n", followTargetIndex + 1, pedestrians.size());
             } else {
                 printf("N key: Switch camera to mode 2 (follow car) or mode 3 (follow pedestrian) first!\n");
@@ -5376,8 +5742,18 @@ void keyboard(unsigned char key, int x, int y) {
                 followTargetIndex = (followTargetIndex - 1 + vehicles.size()) % vehicles.size();
                 printf("Following vehicle %d of %zu\n", followTargetIndex + 1, vehicles.size());
             } else if (currentCameraMode == CAMERA_FOLLOW_PEDESTRIAN && !pedestrians.empty()) {
-                // Ensure we stay within valid range
-                followTargetIndex = (followTargetIndex - 1 + pedestrians.size()) % pedestrians.size();
+                int currentIndex = findPedestrianIndexById(followPedestrianId);
+                if (currentIndex < 0) {
+                    currentIndex = pickPreferredPedestrianIndex(followTargetIndex);
+                }
+                if (currentIndex < 0) {
+                    currentIndex = 0;
+                }
+                int nextIndex = currentIndex - 1;
+                if (nextIndex < 0) {
+                    nextIndex += static_cast<int>(pedestrians.size());
+                }
+                setFollowPedestrianByIndex(nextIndex);
                 printf("Following pedestrian %d of %zu\n", followTargetIndex + 1, pedestrians.size());
             } else {
                 printf("M key: Switch camera to mode 2 (follow car) or mode 3 (follow pedestrian) first!\n");
