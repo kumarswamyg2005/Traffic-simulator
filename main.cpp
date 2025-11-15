@@ -1334,6 +1334,7 @@ void updateExhaustParticles() {
             p.vy = randomRange(-0.05f, 0.05f);
             p.vz = -v.dirZ * 0.1f + randomRange(-0.1f, 0.1f);
             p.life = 1.0f;
+            //color of exhaust
             p.r = 0.3f; p.g = 0.3f; p.b = 0.3f; p.a = 0.3f;
             exhaustParticles.push_back(p);
         }
@@ -2099,7 +2100,7 @@ void drawStreetLights() {
             // Left side of road
             glPushMatrix();
             glTranslatef(x, 0, roadZ - 25);
-            glColor3f(0.3f, 0.3f, 0.3f);
+            glColor3f(1.3f, 0.0f, 0.0f);
             
             // Pole
             GLUquadric* quad = gluNewQuadric();
@@ -3493,13 +3494,15 @@ void drawBuildings() {
                         float seed = fabsf((bld.x + bld.z) * 0.1f) + r * 7.23f + c * 3.11f + face * 13.7f + frameCount * 0.02f;
                         float flick = 0.5f + 0.5f * sinf(seed);
                         bool lit = fmodf(seed, 1.0f) > 0.35f; // ~65% on at night
-                        
+                        //building windows color change
                         if (lit) {
                             float brightness = 0.4f + 0.6f * flick;
+                            //color change 
                             GLfloat emission[] = {0.9f * brightness, 0.8f * brightness, 0.55f * brightness, 1.0f};
                             glMaterialfv(GL_FRONT, GL_EMISSION, emission);
                             glDisable(GL_LIGHTING);
-                            glColor3f(1.0f * brightness, 0.9f * brightness, 0.6f * brightness);
+                            //after that color change here
+                            glColor3f(0.9f * brightness, 0.8f * brightness, 0.55f * brightness);
                             
                             float wx = startX + (c + 0.5f) * windowSpacingX;
                             float wy = startY + (r + 0.5f) * windowSpacingY;
