@@ -1,0 +1,13 @@
+# Build outputs
+traffic_simulator
+*.o
+*.out
+*.app
+
+# Logs and runtime output
+*.log
+simulator_output.log
+
+# Local/editor backups
+*.bak
+.DS_Store
